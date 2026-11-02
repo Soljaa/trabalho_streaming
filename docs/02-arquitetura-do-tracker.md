@@ -14,7 +14,7 @@ flowchart TB
     S["n1 · fonte"] ==> A["n2"]
     S ==> B["n3"]
     A ==> C["n4"]
-    A ==> D["n5"]
+    B ==> D["n5"]
     T -.- S
     T -.- A
     T -.- B
@@ -33,7 +33,7 @@ isso a carga dele não cresce com a taxa de bits do vídeo, só com o número de
 | Decisão | Escolha | Por quê |
 |---|---|---|
 | Topologia | árvore com no máximo `fanout` filhos por nó (padrão 2, árvore binária) | Cada nó recebe de um só pai, o que é simples de implementar e de explicar. O `fanout` é uma opção (`-fanout 3`) para comparar no relatório. |
-| Onde entra um nó novo | no nó com vaga mais perto da raiz (busca em largura) | Mantém a árvore baixa: com fanout 2, 1000 nós ficam a no máximo 9 saltos da fonte. |
+| Onde entra um nó novo | no nível com vaga mais perto da raiz (busca em largura), no nó desse nível com menos filhos | Mantém a árvore baixa: com fanout 2, 1000 nós ficam a no máximo 9 saltos da fonte. Dentro do nível, divide o upload entre os nós. |
 | Transporte | TCP | Entrega garantida e em ordem, e a conexão aberta serve para detectar quando o nó cai. |
 | Formato das mensagens | JSON, um objeto por linha | Legível (dá para depurar lendo o log), e o Go codifica e decodifica com a biblioteca padrão. |
 | Conexão | persistente: aberta no join e mantida até a saída | O tracker precisa avisar o nó a qualquer momento (filho novo, pai novo), então a conexão não pode ser só pedido/resposta. |
@@ -103,7 +103,7 @@ sequenceDiagram
     participant T as Tracker
     participant P as Pai escolhido (n2)
     N->>T: join {role: peer, listen_port: 9004}
-    Note over T: BFS: primeiro nó com vaga é n2
+    Note over T: BFS: nível 1 tem vaga, n2 e n3 empatam com 0 filhos, fica n2
     T->>N: welcome {id: n4, parent: n2 em 127.0.0.1:9002}
     T->>P: child_added {child: n4 em 127.0.0.1:9004}
     loop a cada 5 s
@@ -120,11 +120,12 @@ sequenceDiagram
 
 ## 4. Entrada: onde colocar o nó novo
 
-O tracker faz uma **busca em largura (BFS)** a partir da raiz e escolhe o
-primeiro nó com menos de `fanout` filhos (`findParent` em
-[`tracker/tree.go`](../tracker/tree.go)). Como a BFS anda nível por nível, o nó
-escolhido é sempre o mais raso com vaga, e a árvore vai sendo preenchida em
-camadas:
+O tracker faz uma **busca em largura (BFS)** a partir da raiz, um nível por
+vez, e para no primeiro nível que tem algum nó com menos de `fanout` filhos
+(`findParent` em [`tracker/tree.go`](../tracker/tree.go)). Dentro desse nível,
+escolhe o nó com **menos filhos**; no empate, o primeiro. A árvore vai sendo
+preenchida em camadas, e dentro de cada camada os filhos são distribuídos por
+igual:
 
 ```
 ordem de entrada: n1 (fonte), n2, n3, n4, n5, n6, n7
@@ -133,8 +134,11 @@ ordem de entrada: n1 (fonte), n2, n3, n4, n5, n6, n7
        /      \
      n2        n3           profundidade 1
     /  \      /  \
-  n4    n5  n6    n7        profundidade 2
+  n4    n6  n5    n7        profundidade 2
 ```
+
+O n4 vai para o n2, o n5 para o n3 (que tinha menos filhos), e só então o n6 e
+o n7 completam os pares.
 
 Cada nível a mais é mais um salto entre a fonte e o espectador, ou seja, mais
 atraso. Preencher por níveis deixa a profundidade em cerca de log₂(n): 7 nós em
@@ -142,6 +146,35 @@ atraso. Preencher por níveis deixa a profundidade em cerca de log₂(n): 7 nós
 
 O custo é O(n) por entrada, pois a BFS pode visitar a árvore inteira. Para o
 tamanho deste trabalho (dezenas ou centenas de nós), isso é instantâneo.
+
+### Por que o nó com menos filhos, e não o primeiro com vaga
+
+A primeira versão escolhia o primeiro nó com vaga da BFS. Com 5 nós ela dava
+`n1 -> (n2 -> (n4, n5), n3)`: o n2 enchia antes de o n3 receber alguém. As duas
+regras escolhem um pai no mesmo nível, então:
+
+- **A profundidade é a mesma.** Só com entradas, cada nó novo fica na mesma
+  profundidade nas duas regras, e o atraso até a fonte não muda. Com 3, 7, 15…
+  nós (níveis completos) as duas dão o mesmo formato.
+- **O upload fica dividido.** Na regra antiga o n2 mandava o vídeo duas vezes e
+  o n3 nenhuma; na nova, cada um manda uma. O upload costuma ser o gargalo de
+  uma conexão doméstica.
+- **O pior caso de queda é menor.** Na regra antiga a queda do n2 deixava 2 nós
+  sem vídeo; na nova, 1.
+- **A média de nós afetados por uma queda não muda.** Somando quantos
+  descendentes cada nó tem, cada nó é contado uma vez para cada ancestral, e o
+  total dá a soma das profundidades. Como as profundidades são iguais nas duas
+  regras, a queda de um nó qualquer afeta, em média, o mesmo número de nós. O
+  ganho está no pior caso e na divisão do upload.
+
+O teste `TestAddSpreadsChildren` confere, para árvores de 1 a 40 nós com
+fanout 2 e 3, que os nós de um mesmo nível nunca diferem em mais de um filho.
+Rodado com a regra antiga, ele falha justamente no caso de 5 nós.
+
+**Limite:** a regra equilibra irmãos, não subárvores grandes. Com 9 nós, nas
+duas regras a subárvore do n2 fica com 5 nós e a do n3 com 3. Equilibrar em
+todos os níveis exigiria escolher pela menor subárvore, guardando o tamanho de
+cada uma.
 
 ## 5. Saída e tolerância a falhas
 
@@ -174,8 +207,9 @@ Quando um nó X sai (`Tree.Remove`):
 
 1. X é tirado da lista de filhos do pai dele, e o pai recebe `child_removed`.
 2. Cada filho de X fica órfão **levando a sua subárvore junto**.
-3. Cada órfão é religado no nó com vaga mais perto da raiz, a mesma BFS da
-   entrada. O órfão recebe `parent_changed` e o novo pai recebe `child_added`.
+3. Cada órfão é religado pela mesma regra da entrada: no nível com vaga mais
+   perto da raiz, no nó com menos filhos. O órfão recebe `parent_changed` e o
+   novo pai recebe `child_added`.
 
 Só os filhos diretos de X precisam trocar de pai; os netos continuam recebendo
 dos mesmos pais. Por isso o reparo custa no máximo `fanout` reconexões, não
@@ -187,30 +221,34 @@ dela, então a busca não alcança nenhum nó da subárvore do próprio órfão.
 confere isso com milhares de entradas e saídas aleatórias.
 
 Exemplo real da demonstração (`scripts/demo.ps1`), quando o processo do n2 foi
-morto:
+morto (o n7, filho do n3, já tinha saído por timeout):
 
 ```
 antes                              depois
 n1                                 n1
 ├── n2   <- caiu                   ├── n3
-│   ├── n4                         │   └── n5   (religado em n3)
-│   └── n5                         └── n4       (religado em n1, na vaga do n2)
-└── n3
+│   ├── n4                         │   └── n5
+│   └── n6                         └── n4       (religado em n1, na vaga do n2)
+└── n3                                 └── n6   (religado em n4)
+    └── n5
 ```
+
+O n4 ocupou a vaga do n2 em n1. Com isso o nível 1 ficou com o n3 (1 filho) e
+o n4 (nenhum), e o n6 foi para o n4. Nenhum nó ficou mais longe da fonte, mas o
+n6 agora depende de o n4 se reconectar no n1 para voltar a receber vídeo novo.
 
 ```mermaid
 sequenceDiagram
     participant T as Tracker
     participant R as n1
     participant C as n4 (órfão)
-    participant D as n5 (órfão)
-    participant B as n3
+    participant D as n6 (órfão)
     Note over T: a conexão de n2 cai
     T->>R: child_removed {n2}
     T->>C: parent_changed {n1}
     T->>R: child_added {n4}
-    T->>D: parent_changed {n3}
-    T->>B: child_added {n5}
+    T->>D: parent_changed {n4}
+    T->>C: child_added {n6}
 ```
 
 ### Saída da fonte

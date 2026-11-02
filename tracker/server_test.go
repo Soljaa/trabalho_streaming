@@ -158,23 +158,29 @@ func TestJoinLeaveAndRepair(t *testing.T) {
 	}
 	a.expectChild(protocol.TypeChildAdded, "n4")
 
+	// n2 já tem um filho e n3 nenhum: n5 vai para n3.
 	d := join(t, addr, protocol.RolePeer, 9005)
-	d.welcome("n2") // n5
-	a.expectChild(protocol.TypeChildAdded, "n5")
+	d.welcome("n3") // n5
+	b.expectChild(protocol.TypeChildAdded, "n5")
 
-	// Árvore agora:  n1 -> (n2 -> (n4, n5), n3)
+	e := join(t, addr, protocol.RolePeer, 9006)
+	e.welcome("n2") // n6
+	a.expectChild(protocol.TypeChildAdded, "n6")
+
+	// Árvore agora:  n1 -> (n2 -> (n4, n6), n3 -> n5)
 	a.write(protocol.Message{Type: protocol.TypePing})
 	a.expect(protocol.TypePong)
 
-	// n2 sai com leave: os filhos dele (n4, n5) precisam de pai novo.
-	// n4 pega a vaga que n2 deixou em n1; n5 vai para debaixo de n3.
+	// n2 sai com leave: os filhos dele (n4, n6) precisam de pai novo.
+	// n4 pega a vaga que n2 deixou em n1; n6 vai para debaixo de n4, que no
+	// nível 1 tem menos filhos que n3.
 	a.write(protocol.Message{Type: protocol.TypeLeave})
 	a.expectClosed()
 	src.expectChild(protocol.TypeChildRemoved, "n2")
 	c.expectParentChanged("n1")
 	src.expectChild(protocol.TypeChildAdded, "n4")
-	d.expectParentChanged("n3")
-	b.expectChild(protocol.TypeChildAdded, "n5")
+	e.expectParentChanged("n4")
+	c.expectChild(protocol.TypeChildAdded, "n6")
 
 	// n3 cai sem avisar (conexão fechada): n5 volta para n1.
 	b.conn.Close()
@@ -184,7 +190,7 @@ func TestJoinLeaveAndRepair(t *testing.T) {
 
 	// A fonte sai: todo mundo recebe stream_ended e é desconectado.
 	src.conn.Close()
-	for _, p := range []*testPeer{c, d} {
+	for _, p := range []*testPeer{c, d, e} {
 		p.expect(protocol.TypeStreamEnded)
 		p.expectClosed()
 	}

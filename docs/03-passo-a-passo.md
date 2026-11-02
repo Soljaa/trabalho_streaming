@@ -71,7 +71,7 @@ Separar assim permite testar o algoritmo isoladamente, sem abrir sockets, e
 deixa o código de rede livre de detalhes da árvore.
 
 - `SetRoot`: a fonte vira a raiz.
-- `Add`: busca em largura até o primeiro nó com vaga.
+- `Add`: busca em largura até o primeiro nó com vaga (regra trocada no passo 11).
 - `Remove`: tira o nó e religa cada filho, com a subárvore junto, na vaga mais
   rasa. Devolve um `Removal` dizendo quem perdeu um filho e quem foi religado
   onde, que é exatamente o que o servidor precisa para avisar os nós.
@@ -174,7 +174,8 @@ n1 127.0.0.1:9001
 
 O script [`scripts/demo.ps1`](../scripts/demo.ps1) compila os executáveis e sobe
 o tracker e 6 nós, cada um num processo separado, como seria em máquinas
-diferentes:
+diferentes (esta é a primeira versão; o passo 11 mostra a demo depois da troca
+da regra de entrada):
 
 ```bash
 powershell -ExecutionPolicy Bypass -File scripts\demo.ps1
@@ -272,6 +273,80 @@ fecha o channel, e a goroutine principal imprime o erro ao ver o channel
 fechado. Assim tudo sai na ordem de chegada. É um exemplo pequeno de um problema
 clássico de concorrência: a ordem dos eventos em goroutines diferentes não é
 garantida sem sincronização.
+
+## Passo 11: distribuir os filhos dentro do nível (02/11)
+
+Revendo a árvore do passo 9 apareceu um desequilíbrio: com 5 nós, a regra
+"primeiro nó com vaga" punha o n4 e o n5 debaixo do n2 e deixava o n3 sem
+filhos. O n2 mandava o vídeo duas vezes, o n3 nenhuma, e a queda do n2 cortava
+dois nós.
+
+Mudança: o `findParent` agora anda um nível por vez e, no primeiro nível com
+vaga, escolhe o nó com menos filhos. A profundidade de cada nó continua a mesma;
+a comparação completa está na seção 4 de
+[02-arquitetura-do-tracker.md](02-arquitetura-do-tracker.md).
+
+Testes ajustados:
+
+- `TestAddFillsLevelByLevel`: o n5 agora vai para o n3 e o n6 para o n2.
+- `TestRemoveLeaf` e `TestRemoveInnerNodeKeepsSubtrees`: os pais esperados
+  mudaram junto com a árvore.
+- `TestJoinLeaveAndRepair`: ganhou um sexto nó, para que a saída do n2 continue
+  deixando dois órfãos.
+- `TestAddSpreadsChildren` (novo): para árvores de 1 a 40 nós com fanout 2 e 3,
+  os nós de um mesmo nível nunca diferem em mais de um filho.
+
+Para conferir que o teste novo pega o problema, ele foi rodado contra a regra
+antiga:
+
+```
+--- FAIL: TestAddSpreadsChildren (0.00s)
+    tree_test.go:110: fanout 2, 5 nós: na profundidade 1 há nós com 0 e com 2 filhos
+```
+
+Com a regra nova:
+
+```bash
+go test -count=20 ./tracker
+```
+
+```
+ok  	streaming/tracker	19.588s
+```
+
+A demo também mudou. Com a regra nova, o n6 mudo do roteiro antigo ia para o n2
+e, depois do timeout, o n2 caía com um filho só. Agora são 6 peers e o mudo é o
+n7, que fica no n3; assim o n2 cai com dois filhos. Log do tracker (horários
+removidos):
+
+```
+árvore com 7 nó(s):
+n1 127.0.0.1:9001
+├── n2 127.0.0.1:9002
+│   ├── n4 127.0.0.1:9004
+│   └── n6 127.0.0.1:9006
+└── n3 127.0.0.1:9003
+    ├── n5 127.0.0.1:9005
+    └── n7 127.0.0.1:9007
+
+[n7] saiu: sem heartbeat (timeout)
+...
+[n2] saiu: falha na conexão: ... forcibly closed by the remote host.
+[n4] órfão religado em n1
+[n6] órfão religado em n4
+árvore com 5 nó(s):
+n1 127.0.0.1:9001
+├── n3 127.0.0.1:9003
+│   └── n5 127.0.0.1:9005
+└── n4 127.0.0.1:9004
+    └── n6 127.0.0.1:9006
+```
+
+O n6 foi para debaixo do n4, que era seu irmão: depois de ocupar a vaga do n2,
+o n4 é o nó do nível 1 com menos filhos. Nenhum nó ficou mais longe da fonte,
+mas o n6 só volta a receber vídeo novo depois que o n4 se reconectar no n1. É um
+caso para o cliente tratar: um nó pode receber `parent_changed` e `child_added`
+no mesmo reparo.
 
 ## Próximos passos
 

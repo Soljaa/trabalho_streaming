@@ -73,12 +73,13 @@ func parentOf(tr *Tree, id string) string {
 
 func TestAddFillsLevelByLevel(t *testing.T) {
 	tr := build(t, 2, 7)
+	// n4 e n5 vão para pais diferentes; só então n2 e n3 ganham o segundo filho.
 	//         n1
 	//      /      \
 	//    n2        n3
 	//   /  \      /  \
-	//  n4  n5    n6  n7
-	want := map[string]string{"n2": "n1", "n3": "n1", "n4": "n2", "n5": "n2", "n6": "n3", "n7": "n3"}
+	//  n4  n6    n5  n7
+	want := map[string]string{"n2": "n1", "n3": "n1", "n4": "n2", "n5": "n3", "n6": "n2", "n7": "n3"}
 	for id, parent := range want {
 		if got := parentOf(tr, id); got != parent {
 			t.Errorf("pai de %s = %s, esperado %s", id, got, parent)
@@ -86,6 +87,32 @@ func TestAddFillsLevelByLevel(t *testing.T) {
 	}
 	if d := tr.Get("n7").Depth(); d != 2 {
 		t.Errorf("profundidade de n7 = %d, esperado 2", d)
+	}
+}
+
+// TestAddSpreadsChildren confere, para árvores de vários tamanhos montadas só
+// com entradas, que os nós de um mesmo nível nunca diferem em mais de 1 filho:
+// ninguém ganha o segundo filho antes de os outros do nível ganharem o primeiro.
+func TestAddSpreadsChildren(t *testing.T) {
+	for _, fanout := range []int{2, 3} {
+		for size := 1; size <= 40; size++ {
+			tr := build(t, fanout, size)
+			level := []*Node{tr.root}
+			for depth := 0; len(level) > 0; depth++ {
+				fewest, most := fanout, 0
+				var next []*Node
+				for _, n := range level {
+					fewest = min(fewest, len(n.Children))
+					most = max(most, len(n.Children))
+					next = append(next, n.Children...)
+				}
+				if most-fewest > 1 {
+					t.Fatalf("fanout %d, %d nós: na profundidade %d há nós com %d e com %d filhos",
+						fanout, size, depth, fewest, most)
+				}
+				level = next
+			}
+		}
 	}
 }
 
@@ -122,19 +149,20 @@ func TestRemoveLeaf(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkTree(t, tr)
-	if r.OldParent.ID != "n2" || len(r.Moved) != 0 {
-		t.Errorf("OldParent=%s Moved=%d, esperado n2 e nenhum órfão", r.OldParent.ID, len(r.Moved))
+	if r.OldParent.ID != "n3" || len(r.Moved) != 0 {
+		t.Errorf("OldParent=%s Moved=%d, esperado n3 e nenhum órfão", r.OldParent.ID, len(r.Moved))
 	}
-	// A vaga liberada em n2 é a mais rasa, então o próximo nó entra ali.
+	// A vaga liberada em n3 é a mais rasa, então o próximo nó entra ali.
 	tr.Add("n8", "addr8")
-	if got := parentOf(tr, "n8"); got != "n2" {
-		t.Errorf("pai de n8 = %s, esperado n2", got)
+	if got := parentOf(tr, "n8"); got != "n3" {
+		t.Errorf("pai de n8 = %s, esperado n3", got)
 	}
 }
 
 func TestRemoveInnerNodeKeepsSubtrees(t *testing.T) {
 	tr := build(t, 2, 11)
-	// n2 tem os filhos n4 e n5; n4 tem n8 e n9; n5 tem n10 e n11.
+	// n2 tem os filhos n4 e n6; n3 tem n5 e n7. No nível 2 cada nó tem um
+	// filho: n4 tem n8, n6 tem n9, n5 tem n10 e n7 tem n11.
 	r, err := tr.Remove("n2")
 	if err != nil {
 		t.Fatal(err)
@@ -143,16 +171,16 @@ func TestRemoveInnerNodeKeepsSubtrees(t *testing.T) {
 	if len(r.Moved) != 2 {
 		t.Fatalf("%d órfãos religados, esperado 2", len(r.Moved))
 	}
-	// n4 ocupa a vaga que n2 deixou em n1; n5 vai para a vaga mais rasa que
-	// sobrar: debaixo de n6, a primeira folha do nível 2.
+	// n4 ocupa a vaga que n2 deixou em n1. Depois disso o nível 1 tem n3 (2
+	// filhos) e n4 (1 filho), então n6 vai para debaixo de n4.
 	if got := parentOf(tr, "n4"); got != "n1" {
 		t.Errorf("pai de n4 = %s, esperado n1", got)
 	}
-	if got := parentOf(tr, "n5"); got != "n6" {
-		t.Errorf("pai de n5 = %s, esperado n6", got)
+	if got := parentOf(tr, "n6"); got != "n4" {
+		t.Errorf("pai de n6 = %s, esperado n4", got)
 	}
 	// Os netos não mudam de pai.
-	for id, parent := range map[string]string{"n8": "n4", "n9": "n4", "n10": "n5", "n11": "n5"} {
+	for id, parent := range map[string]string{"n8": "n4", "n9": "n6", "n10": "n5", "n11": "n7"} {
 		if got := parentOf(tr, id); got != parent {
 			t.Errorf("pai de %s = %s, esperado %s", id, got, parent)
 		}

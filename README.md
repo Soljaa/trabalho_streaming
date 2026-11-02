@@ -72,7 +72,7 @@ powershell -ExecutionPolicy Bypass -File scripts\demo.ps1
 ```
 
 O `-v` mostra os logs do tracker com a árvore mudando. O `demo.ps1` sobe o tracker
-e 6 nós como processos separados, provoca as três falhas (timeout, queda, saída da
+e 7 nós como processos separados, provoca as três falhas (timeout, queda, saída da
 fonte) e deixa os logs de cada processo em `demo-logs\`.
 
 ## Documentação

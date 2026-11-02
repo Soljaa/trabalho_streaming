@@ -2,8 +2,8 @@
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\demo.ps1
 #
-# Roteiro: sobe o tracker (timeout de heartbeat de 6 s), a fonte e 5 peers;
-# o n6 entra sem mandar ping e é derrubado por timeout; depois o processo do
+# Roteiro: sobe o tracker (timeout de heartbeat de 6 s), a fonte e 6 peers;
+# o n7 entra sem mandar ping e é derrubado por timeout; depois o processo do
 # n2 é morto (queda) e os filhos dele são religados; por fim a fonte é morta
 # e todos recebem stream_ended. Os logs de cada processo ficam em demo-logs\.
 
@@ -33,7 +33,9 @@ $n4 = Start-Node "n4" "peer-sim.exe" "-port 9004"
 Start-Sleep -Milliseconds 500
 $n5 = Start-Node "n5" "peer-sim.exe" "-port 9005"
 Start-Sleep -Milliseconds 500
-$n6 = Start-Node "n6-mudo" "peer-sim.exe" "-port 9006 -heartbeat 0"
+$n6 = Start-Node "n6" "peer-sim.exe" "-port 9006"
+Start-Sleep -Milliseconds 500
+$n7 = Start-Node "n7-mudo" "peer-sim.exe" "-port 9007 -heartbeat 0"
 Start-Sleep -Seconds 8
 
 Write-Output "matando o n2 (queda sem leave)..."
@@ -44,10 +46,10 @@ Write-Output "matando a fonte..."
 Stop-Process -Id $src.Id -Force
 Start-Sleep -Seconds 2
 
-foreach ($p in @($tracker, $n3, $n4, $n5, $n6)) { if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force } }
+foreach ($p in @($tracker, $n3, $n4, $n5, $n6, $n7)) { if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force } }
 Start-Sleep -Milliseconds 300
 
-foreach ($f in @("tracker", "n1-fonte", "n4")) {
+foreach ($f in @("tracker", "n1-fonte", "n4", "n6")) {
     Write-Output "===================== $f ====================="
     Get-Content (Join-Path $logs "$f.log") -Encoding utf8
 }

@@ -75,7 +75,8 @@ func (t *Tree) SetRoot(id, addr string) (*Node, error) {
 	return t.root, nil
 }
 
-// Add coloca um novo nó como filho do nó mais raso que ainda tem vaga.
+// Add coloca um novo nó no nível mais raso que ainda tem vaga, como filho do
+// nó desse nível que tem menos filhos.
 func (t *Tree) Add(id, addr string) (*Node, error) {
 	if t.root == nil {
 		return nil, ErrNoSource
@@ -88,22 +89,34 @@ func (t *Tree) Add(id, addr string) (*Node, error) {
 	return n, nil
 }
 
-// findParent faz uma busca em largura (BFS) a partir da raiz e devolve o
-// primeiro nó com menos de `fanout` filhos. Como a BFS visita a árvore nível
-// por nível, o escolhido é sempre o nó com vaga mais perto da fonte, o que
-// mantém a árvore baixa (cada nível a mais é mais um salto de atraso).
+// findParent faz uma busca em largura (BFS) a partir da raiz, um nível por
+// vez, e para no primeiro nível que tem vaga. Assim o escolhido é sempre um
+// nó com vaga mais perto da fonte, o que mantém a árvore baixa (cada nível a
+// mais é mais um salto de atraso).
+//
+// Dentro desse nível, escolhe o nó com menos filhos (no empate, o primeiro).
+// Um nó só ganha o segundo filho depois que todos os nós do nível ganharam o
+// primeiro: o upload fica dividido e a queda de um nó corta menos gente.
+// Pegar o primeiro nó com vaga daria a mesma profundidade, mas encheria n2
+// (n4 e n5) enquanto n3 ficava sem filhos.
 //
 // Nunca devolve nil: uma folha tem 0 filhos e fanout >= 1, então sempre há
 // vaga em algum lugar.
 func (t *Tree) findParent() *Node {
-	queue := []*Node{t.root}
-	for len(queue) > 0 {
-		n := queue[0]
-		queue = queue[1:]
-		if len(n.Children) < t.fanout {
-			return n
+	level := []*Node{t.root}
+	for len(level) > 0 {
+		best := level[0]
+		var next []*Node
+		for _, n := range level {
+			if len(n.Children) < len(best.Children) {
+				best = n
+			}
+			next = append(next, n.Children...)
 		}
-		queue = append(queue, n.Children...)
+		if len(best.Children) < t.fanout {
+			return best
+		}
+		level = next
 	}
 	return nil
 }
