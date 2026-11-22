@@ -202,8 +202,86 @@ func TestRemoveRootEmptiesTree(t *testing.T) {
 	}
 }
 
-// TestRandomChurn faz milhares de entradas e saídas aleatórias e confere as
-// regras da árvore depois de cada operação.
+func TestRelocate(t *testing.T) {
+	tr := build(t, 2, 9)
+	//            n1
+	//        /        \
+	//      n2          n3
+	//     /  \        /  \
+	//   n4    n6    n5    n7
+	//   |     |
+	//   n8    n9
+	//
+	// n4 não alcança n2. No nível 1, n2 é evitado e n3 está cheio; no nível 2,
+	// n5 e n7 não têm filhos, e n5 vem primeiro. n4 leva n8 junto.
+	r, err := tr.Relocate("n4", "n2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkTree(t, tr)
+	if r.Node.ID != "n4" || r.OldParent.ID != "n2" {
+		t.Errorf("Relocation = %s saindo de %s, esperado n4 saindo de n2", r.Node.ID, r.OldParent.ID)
+	}
+	for id, parent := range map[string]string{"n4": "n5", "n8": "n4", "n6": "n2"} {
+		if got := parentOf(tr, id); got != parent {
+			t.Errorf("pai de %s = %s, esperado %s", id, got, parent)
+		}
+	}
+
+	// Aviso atrasado: n2 já não é o pai de n4. Nada muda.
+	if _, err := tr.Relocate("n4", "n2"); !errors.Is(err, ErrNotParent) {
+		t.Errorf("aviso atrasado: erro %v, esperado ErrNotParent", err)
+	}
+	if _, err := tr.Relocate("n1", "n2"); !errors.Is(err, ErrNotParent) {
+		t.Errorf("aviso da raiz: erro %v, esperado ErrNotParent", err)
+	}
+	if _, err := tr.Relocate("n99", "n2"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("nó inexistente: erro %v, esperado ErrNotFound", err)
+	}
+
+	// n5 sai e n4 fica órfão. No nível 1, n2 e n3 têm um filho cada; sem a
+	// restrição n4 voltaria para n2 (o primeiro), mas n4 evita n2 e vai para n3.
+	if _, err := tr.Remove("n5"); err != nil {
+		t.Fatal(err)
+	}
+	checkTree(t, tr)
+	if got := parentOf(tr, "n4"); got != "n3" {
+		t.Errorf("pai de n4 depois do reparo = %s, esperado n3", got)
+	}
+}
+
+func TestRelocateWithoutOtherSlot(t *testing.T) {
+	// Só a fonte e n2: não há outro pai, então n2 fica onde está.
+	tr := build(t, 2, 2)
+	if _, err := tr.Relocate("n2", "n1"); !errors.Is(err, ErrNoOtherSlot) {
+		t.Fatalf("erro %v, esperado ErrNoOtherSlot", err)
+	}
+	checkTree(t, tr)
+	if got := parentOf(tr, "n2"); got != "n1" {
+		t.Fatalf("pai de n2 = %s, esperado n1", got)
+	}
+
+	// Entra n3 (debaixo de n1). Avisando de novo, n2 agora tem para onde ir.
+	tr.Add("n3", "addr3")
+	if _, err := tr.Relocate("n2", "n1"); err != nil {
+		t.Fatal(err)
+	}
+	checkTree(t, tr)
+	if got := parentOf(tr, "n2"); got != "n3" {
+		t.Fatalf("pai de n2 = %s, esperado n3", got)
+	}
+
+	// n3 sai: a única vaga é em n1, que n2 evita. Melhor um pai problemático
+	// que ficar fora da árvore, então n2 volta para n1.
+	tr.Remove("n3")
+	checkTree(t, tr)
+	if got := parentOf(tr, "n2"); got != "n1" {
+		t.Fatalf("pai de n2 = %s, esperado n1", got)
+	}
+}
+
+// TestRandomChurn faz milhares de entradas, saídas e trocas de pai aleatórias
+// e confere as regras da árvore depois de cada operação.
 func TestRandomChurn(t *testing.T) {
 	rng := rand.New(rand.NewPCG(1, 2)) // semente fixa: o teste é reproduzível
 	for _, fanout := range []int{1, 2, 3} {
@@ -211,12 +289,19 @@ func TestRandomChurn(t *testing.T) {
 		var alive []string
 		next := 2
 		for range 3000 {
-			if len(alive) > 0 && rng.IntN(3) == 0 {
+			op := rng.IntN(6)
+			if len(alive) > 0 && op < 2 {
 				i := rng.IntN(len(alive))
 				if _, err := tr.Remove(alive[i]); err != nil {
 					t.Fatal(err)
 				}
 				alive = append(alive[:i], alive[i+1:]...)
+			} else if len(alive) > 0 && op == 2 {
+				n := tr.Get(alive[rng.IntN(len(alive))])
+				_, err := tr.Relocate(n.ID, n.Parent.ID)
+				if err != nil && !errors.Is(err, ErrNoOtherSlot) {
+					t.Fatal(err)
+				}
 			} else {
 				id := fmt.Sprintf("n%d", next)
 				next++

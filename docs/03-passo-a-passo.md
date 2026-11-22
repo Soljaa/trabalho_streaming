@@ -348,6 +348,50 @@ mas o n6 só volta a receber vídeo novo depois que o n4 se reconectar no n1. É
 caso para o cliente tratar: um nó pode receber `parent_changed` e `child_added`
 no mesmo reparo.
 
+## Passo 12: pai vivo, mas inalcançável (22/11)
+
+Revendo o cenário de entrada (seção 9.1 da arquitetura final) surgiu a
+pergunta: o tracker não deveria confirmar que o pai está vivo antes de mandar o
+`welcome` ao filho? A conclusão foi que não: a confirmação só prova que o pai
+estava vivo no momento da resposta, e o filho já está registrado como filho
+dele, então, se o pai morrer, o tracker manda `parent_changed` de qualquer
+jeito. A discussão completa e as medições estão na seção 9.1 de
+[04-arquitetura-final.md](04-arquitetura-final.md).
+
+A análise mostrou um caso que nem a confirmação nem o heartbeat cobrem: o pai
+vivo para o tracker, mas com a porta bloqueada (Firewall do Windows). O filho
+tentaria para sempre. Mudanças:
+
+- **Protocolo:** mensagem nova `parent_unreachable`, do nó para o tracker, com
+  o pai que ele não alcança.
+- **Árvore:** `Tree.Relocate` muda o nó de pai sem tirar o pai antigo da
+  árvore. O nó guarda os pais que avisou não alcançar (`avoid`), e a BFS
+  (agora em `search`, chamada por `findParent`) pula esses pais, também nos
+  reparos futuros. Sem outra vaga, o nó fica onde está.
+- **Servidor:** `Server.relocate` ignora avisos atrasados (o pai citado já não
+  é o atual) e manda `child_removed`, `parent_changed` e `child_added`.
+- **peer-sim:** agora abre a porta de escuta e testa a conexão com cada pai
+  que recebe: 3 tentativas, 1 s entre elas, prazo de 2 s cada. Se todas
+  falharem, manda `parent_unreachable` e volta a testar 5 s depois. A opção
+  nova `-firewall` simula a porta bloqueada.
+
+Testes novos:
+
+- `TestRelocate`: o nó vai para o nível mais raso com vaga sem passar pelo pai
+  avisado, leva a subárvore junto, ignora avisos atrasados e, num reparo
+  posterior, evita o pai avisado.
+- `TestRelocateWithoutOtherSlot`: sem outra vaga o nó fica; quando entra outro
+  nó, o aviso seguinte funciona; se a única vaga for a do pai evitado, o reparo
+  usa esse pai mesmo assim.
+- `TestRandomChurn`: passou a misturar trocas de pai com as entradas e saídas.
+- `TestParentUnreachable`: o mesmo fluxo por TCP, conferindo as mensagens de
+  cada nó.
+
+A demo nova `scripts/demo-firewall.ps1` sobe um n2 com `-firewall`; cada nó
+que cai debaixo dele é mudado de lugar cerca de 2 s depois (log na seção 9.5 da
+arquitetura final). A demo antiga continua com o mesmo log do tracker; os logs
+dos peers ganharam as linhas "conectou no pai".
+
 ## Próximos passos
 
 - Integrar com o cliente da Lina (checklist na seção 7 da arquitetura) e

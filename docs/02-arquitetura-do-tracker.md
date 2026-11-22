@@ -71,6 +71,7 @@ importa.
 | `join` | `role` (`source` ou `peer`), `listen_port` | Primeira mensagem, obrigatória. `listen_port` é a porta onde o nó aceita conexões dos filhos. |
 | `ping` | nenhum | A cada 5 s (heartbeat). |
 | `leave` | nenhum | Ao sair de forma voluntária. |
+| `parent_unreachable` | `parent` (`id` e `addr` do pai que não atende) | Depois de 3 tentativas seguidas sem conseguir se conectar ao pai. O tracker muda o nó de lugar (seção 5). |
 
 ### Mensagens do tracker para o nó
 
@@ -80,8 +81,8 @@ importa.
 | `error` | `error` (texto) | Join recusado. O tracker fecha a conexão logo depois. |
 | `pong` | nenhum | Resposta ao ping; mostra que o tracker está vivo. |
 | `child_added` | `child` (`id` e `addr`) | Ganhou um filho: começar a transmitir para ele. |
-| `child_removed` | `child` | Esse filho saiu: parar de transmitir para ele. |
-| `parent_changed` | `parent` | O pai saiu: passar a receber do novo pai. |
+| `child_removed` | `child` | Esse filho saiu ou mudou de pai: parar de transmitir para ele. |
+| `parent_changed` | `parent` | O pai saiu, ou o nó avisou que não o alcança: passar a receber do novo pai. |
 | `stream_ended` | nenhum | A fonte saiu e a transmissão acabou. O tracker fecha a conexão. |
 
 ### Exemplo de sessão
@@ -122,7 +123,7 @@ sequenceDiagram
 
 O tracker faz uma **busca em largura (BFS)** a partir da raiz, um nível por
 vez, e para no primeiro nível que tem algum nó com menos de `fanout` filhos
-(`findParent` em [`tracker/tree.go`](../tracker/tree.go)). Dentro desse nível,
+(`findParent` e `search` em [`tracker/tree.go`](../tracker/tree.go)). Dentro desse nível,
 escolhe o nó com **menos filhos**; no empate, o primeiro. A árvore vai sendo
 preenchida em camadas, e dentro de cada camada os filhos são distribuídos por
 igual:
@@ -208,8 +209,9 @@ Quando um nó X sai (`Tree.Remove`):
 1. X é tirado da lista de filhos do pai dele, e o pai recebe `child_removed`.
 2. Cada filho de X fica órfão **levando a sua subárvore junto**.
 3. Cada órfão é religado pela mesma regra da entrada: no nível com vaga mais
-   perto da raiz, no nó com menos filhos. O órfão recebe `parent_changed` e o
-   novo pai recebe `child_added`.
+   perto da raiz, no nó com menos filhos, evitando os pais que ele já avisou
+   não alcançar. O órfão recebe `parent_changed` e o novo pai recebe
+   `child_added`.
 
 Só os filhos diretos de X precisam trocar de pai; os netos continuam recebendo
 dos mesmos pais. Por isso o reparo custa no máximo `fanout` reconexões, não
@@ -257,6 +259,33 @@ Sem a fonte não há vídeo. Quando a raiz sai, o tracker manda `stream_ended` a
 todos, fecha as conexões e esvazia a árvore. Os nós podem fazer join de novo
 quando uma nova fonte entrar.
 
+### Pai vivo, mas inalcançável
+
+O heartbeat prova que o pai está vivo para o tracker, não que os filhos chegam
+até ele. Com a porta do pai bloqueada (o caso típico é o Firewall do Windows),
+o pai segue mandando `ping` e nenhum dos casos acima acontece. Só o filho
+percebe, então é ele quem avisa: depois de 3 tentativas seguidas sem conseguir
+se conectar, manda `parent_unreachable` com o pai a que se refere.
+
+O tracker trata o aviso em `Server.relocate`, que chama `Tree.Relocate`:
+
+1. Se o pai citado já não é o pai do nó (o aviso cruzou com um
+   `parent_changed`), ignora o aviso.
+2. Anota o pai citado na lista de pais que o nó evita. Essa lista vale também
+   para os reparos futuros.
+3. Desliga o nó (com a subárvore) e procura um novo pai pela BFS da entrada,
+   pulando os pais que o nó evita. Como na saída, a busca não passa pela
+   subárvore do próprio nó, então não cria ciclo.
+4. Se não houver outra vaga, devolve o nó ao mesmo lugar. Ele continua tentando
+   e pode avisar de novo depois.
+5. Senão, manda `child_removed` ao pai antigo, `parent_changed` ao nó e
+   `child_added` ao novo pai. **O pai antigo continua na árvore**: para o
+   tracker ele está vivo, e o problema pode estar só no caminho entre os dois.
+
+O roteiro `scripts/demo-firewall.ps1` mostra isso com um n2 que não abre a
+porta (`peer-sim -firewall`). O cenário completo, com o diagrama e o log, está
+na seção 9.5 de [04-arquitetura-final.md](04-arquitetura-final.md).
+
 ### Alternativa considerada
 
 Outra forma de reparo seria **promover** um dos filhos de X para o lugar dele e
@@ -270,7 +299,7 @@ mesmo algoritmo da entrada, e o código fica menor.
 ```mermaid
 flowchart LR
     subgraph c1["conexão do nó n2"]
-        R1["handleConn<br/>lê join, ping, leave"]
+        R1["handleConn<br/>lê join, ping, leave,<br/>parent_unreachable"]
         Q1[["fila send<br/>(channel, 32)"]]
         W1["writeLoop<br/>escreve no socket"]
     end
@@ -311,6 +340,11 @@ Checklist para o cliente da Lina se integrar ao tracker:
 1. Abrir um listener TCP numa porta (`listen_port`) **antes** do join, para os filhos conseguirem conectar.
 2. Conectar no tracker e mandar `{"type":"join","role":"peer","listen_port":N}` (ou `"source"` para a fonte).
 3. Ler o `welcome`, guardar o `id` e conectar no `parent.addr` para receber os segmentos.
+   Se não conseguir (conexão recusada, `Dial` sem completar em 2 s ou nenhum
+   frame em 5 s), tentar de novo a cada 1 s, sempre no último pai que o tracker
+   indicou. A cada 3 falhas seguidas, mandar
+   `{"type":"parent_unreachable","parent":{"id":...,"addr":...}}`. Nunca
+   escolher outro pai por conta própria.
 4. Mandar `{"type":"ping"}` a cada 5 s enquanto estiver na rede.
 5. Reagir às mensagens:
    - `child_added`: começar a mandar segmentos para esse filho.
@@ -323,7 +357,8 @@ Checklist para o cliente da Lina se integrar ao tracker:
 
 O pacote `streaming/protocol` pode ser importado direto, e o
 [`cmd/peer-sim/main.go`](../cmd/peer-sim/main.go) já tem o esqueleto da parte de
-controle (join, ping, leitura das mensagens, leave).
+controle (join, ping, leitura das mensagens, leave) e o teste de conexão com o
+pai, com o aviso `parent_unreachable`.
 
 **Decisão a combinar: quem abre a conexão de dados.** O tracker avisa os dois
 lados (o filho recebe o endereço do pai, e o pai recebe o endereço do filho),
@@ -348,7 +383,11 @@ então os dois modelos funcionam:
   upload de cada nó, com nós mais fortes mais perto da raiz.
 - **Folhas não contribuem com upload.** Numa malha, ou com múltiplas árvores
   (como no SplitStream), todo nó repassaria alguma parte do vídeo.
-- **NAT e firewall** não são tratados: os nós precisam conseguir se conectar
-  diretamente, como acontece numa rede local.
+- **NAT e firewall** são tratados só em parte. Um filho que não alcança o pai
+  é mudado de lugar (`parent_unreachable`), mas o nó bloqueado continua
+  recebendo filhos novos, e cada um fica alguns segundos sem vídeo até ser
+  mudado. Uma melhoria seria parar de dar filhos a um nó que dois filhos
+  diferentes não alcançaram. Se a porta bloqueada for a da fonte, nada
+  resolve.
 - **Sem autenticação**, por ser fora do escopo do trabalho: qualquer um que
   alcance a porta pode entrar ou se passar por fonte.

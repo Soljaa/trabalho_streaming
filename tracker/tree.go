@@ -15,6 +15,8 @@ var (
 	ErrNoSource    = errors.New("ainda não há fonte; tente de novo mais tarde")
 	ErrDuplicateID = errors.New("id já está na árvore")
 	ErrNotFound    = errors.New("nó não está na árvore")
+	ErrNotParent   = errors.New("o nó informado não é o pai atual")
+	ErrNoOtherSlot = errors.New("não há outro pai com vaga")
 )
 
 // Node é um nó da árvore de distribuição.
@@ -23,6 +25,11 @@ type Node struct {
 	Addr     string // ip:porta onde o nó aceita conexões dos filhos
 	Parent   *Node  // nil só na raiz
 	Children []*Node
+
+	// avoid guarda os IDs dos pais que este nó avisou não conseguir alcançar
+	// (ver Relocate). A busca de pai pula esses nós, para o tracker não o
+	// colocar de novo debaixo de um deles num reparo futuro.
+	avoid map[string]bool
 }
 
 // Info converte o nó para o formato usado nas mensagens.
@@ -85,14 +92,24 @@ func (t *Tree) Add(id, addr string) (*Node, error) {
 		return nil, ErrDuplicateID
 	}
 	n := t.register(&Node{ID: id, Addr: addr})
-	t.attach(n, t.findParent())
+	t.attach(n, t.findParent(n))
 	return n, nil
 }
 
-// findParent faz uma busca em largura (BFS) a partir da raiz, um nível por
-// vez, e para no primeiro nível que tem vaga. Assim o escolhido é sempre um
-// nó com vaga mais perto da fonte, o que mantém a árvore baixa (cada nível a
-// mais é mais um salto de atraso).
+// findParent escolhe o pai do nó n, que ainda está fora da árvore. Pula os
+// pais que n avisou não alcançar; se só eles tiverem vaga, ignora a restrição,
+// porque um pai problemático ainda é melhor que deixar n fora da árvore.
+func (t *Tree) findParent(n *Node) *Node {
+	if p := t.search(n.avoid); p != nil {
+		return p
+	}
+	return t.search(nil)
+}
+
+// search faz uma busca em largura (BFS) a partir da raiz, um nível por vez, e
+// para no primeiro nível que tem vaga. Assim o escolhido é sempre um nó com
+// vaga mais perto da fonte, o que mantém a árvore baixa (cada nível a mais é
+// mais um salto de atraso).
 //
 // Dentro desse nível, escolhe o nó com menos filhos (no empate, o primeiro).
 // Um nó só ganha o segundo filho depois que todos os nós do nível ganharam o
@@ -100,20 +117,25 @@ func (t *Tree) Add(id, addr string) (*Node, error) {
 // Pegar o primeiro nó com vaga daria a mesma profundidade, mas encheria n2
 // (n4 e n5) enquanto n3 ficava sem filhos.
 //
-// Nunca devolve nil: uma folha tem 0 filhos e fanout >= 1, então sempre há
-// vaga em algum lugar.
-func (t *Tree) findParent() *Node {
+// Os nós em avoid não são candidatos, mas a busca continua pelos filhos deles.
+// Com avoid vazio, nunca devolve nil: uma folha tem 0 filhos e fanout >= 1,
+// então sempre há vaga em algum lugar. Com avoid, devolve nil se todos os nós
+// com vaga estiverem em avoid.
+func (t *Tree) search(avoid map[string]bool) *Node {
 	level := []*Node{t.root}
 	for len(level) > 0 {
-		best := level[0]
+		var best *Node
 		var next []*Node
 		for _, n := range level {
-			if len(n.Children) < len(best.Children) {
+			next = append(next, n.Children...)
+			if avoid[n.ID] {
+				continue
+			}
+			if best == nil || len(n.Children) < len(best.Children) {
 				best = n
 			}
-			next = append(next, n.Children...)
 		}
-		if len(best.Children) < t.fanout {
+		if best != nil && len(best.Children) < t.fanout {
 			return best
 		}
 		level = next
@@ -146,9 +168,10 @@ type Removal struct {
 //
 // Cada filho leva junto a sua subárvore inteira: só os filhos diretos trocam
 // de pai, os netos continuam recebendo dos mesmos pais de antes. Cada órfão é
-// religado no nó mais raso com vaga (a mesma BFS do Add). Como a BFS parte da
-// raiz e o órfão já está desligado dela, a busca nunca passa pela subárvore
-// do próprio órfão, então não há risco de criar um ciclo.
+// religado no nó mais raso com vaga (a mesma BFS do Add), evitando os pais
+// que ele já avisou não alcançar. Como a BFS parte da raiz e o órfão já está
+// desligado dela, a busca nunca passa pela subárvore do próprio órfão, então
+// não há risco de criar um ciclo.
 //
 // Remover a raiz (a fonte) esvazia a árvore: sem fonte não há o que transmitir.
 func (t *Tree) Remove(id string) (Removal, error) {
@@ -171,10 +194,54 @@ func (t *Tree) Remove(id string) (Removal, error) {
 	n.Children = nil
 	for _, c := range orphans {
 		c.Parent = nil
-		t.attach(c, t.findParent())
+		t.attach(c, t.findParent(c))
 		r.Moved = append(r.Moved, c)
 	}
 	return r, nil
+}
+
+// Relocation descreve a troca de pai pedida pelo próprio nó.
+type Relocation struct {
+	Node      *Node // quem trocou de pai; Node.Parent já é o novo pai
+	OldParent *Node // o pai que ele não alcançava
+}
+
+// Relocate troca o pai do nó id, que avisou (parent_unreachable) não
+// conseguir se conectar ao pai parentID. Para o tracker esse pai está vivo
+// (manda ping), então ele continua onde está: quem muda de lugar é o filho,
+// levando a subárvore junto. O novo pai sai da mesma BFS do Add, sem contar
+// parentID nem os outros pais que o nó já avisou não alcançar.
+//
+// O aviso pode estar atrasado: se parentID já não é o pai do nó (um
+// parent_changed cruzou com o aviso), devolve ErrNotParent e nada muda. Se
+// não houver outro pai com vaga, devolve ErrNoOtherSlot e o nó fica onde
+// estava; parentID continua anotado e será evitado nos próximos reparos.
+func (t *Tree) Relocate(id, parentID string) (Relocation, error) {
+	n, ok := t.nodes[id]
+	if !ok {
+		return Relocation{}, ErrNotFound
+	}
+	old := n.Parent
+	if old == nil || old.ID != parentID {
+		return Relocation{}, ErrNotParent
+	}
+	if n.avoid == nil {
+		n.avoid = make(map[string]bool)
+	}
+	n.avoid[parentID] = true
+
+	// n sai da árvore antes da busca, para que nem ele nem a subárvore dele
+	// sejam candidatos (um nó debaixo de um descendente seria um ciclo).
+	i := slices.Index(old.Children, n)
+	t.detach(n)
+	p := t.search(n.avoid)
+	if p == nil {
+		n.Parent = old
+		old.Children = slices.Insert(old.Children, i, n) // volta para a mesma posição
+		return Relocation{}, ErrNoOtherSlot
+	}
+	t.attach(n, p)
+	return Relocation{Node: n, OldParent: old}, nil
 }
 
 // String desenha a árvore, por exemplo:

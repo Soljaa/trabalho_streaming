@@ -29,7 +29,7 @@ type Config struct {
 // cada nó quando o pai ou os filhos dele mudam.
 //
 // Cada conexão é atendida por duas goroutines:
-//   - handleConn lê as mensagens do nó (join, ping, leave);
+//   - handleConn lê as mensagens do nó (join, ping, leave, parent_unreachable);
 //   - writeLoop escreve as mensagens que o tracker manda para o nó, tiradas
 //     de uma fila (o channel `send`).
 //
@@ -93,9 +93,10 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 	go c.writeLoop()
 
-	// 2) Depois do join, só esperamos pings e o leave. Cada leitura tem um
-	// prazo: se o nó ficar calado por mais de HeartbeatTimeout, o Decode
-	// devolve erro de timeout e o nó é tratado como morto.
+	// 2) Depois do join, esperamos pings, o leave e avisos de pai inalcançável.
+	// Cada leitura tem um prazo: se o nó ficar calado por mais de
+	// HeartbeatTimeout, o Decode devolve erro de timeout e o nó é tratado
+	// como morto.
 	for {
 		conn.SetReadDeadline(time.Now().Add(s.cfg.HeartbeatTimeout))
 		var msg protocol.Message
@@ -109,6 +110,8 @@ func (s *Server) handleConn(conn net.Conn) {
 		case protocol.TypeLeave:
 			s.remove(c.id, "pediu para sair (leave)")
 			return
+		case protocol.TypeParentUnreachable:
+			s.relocate(c.id, msg.Parent)
 		default:
 			log.Printf("[%s] mensagem desconhecida %q ignorada", c.id, msg.Type)
 		}
@@ -215,6 +218,41 @@ func (s *Server) remove(id, reason string) {
 		s.sendLocked(orphan.Parent.ID, protocol.Message{Type: protocol.TypeChildAdded, Child: orphan.Info()})
 		log.Printf("[%s] órfão religado em %s", orphan.ID, orphan.Parent.ID)
 	}
+	s.logTreeLocked()
+}
+
+// relocate atende o parent_unreachable: o nó não consegue se conectar ao pai,
+// embora o pai continue vivo para o tracker (o caso típico é o firewall da
+// máquina do pai bloqueando a porta). Só o tracker conhece a árvore, então é
+// ele quem escolhe o novo pai; o pai antigo continua na árvore.
+func (s *Server) relocate(id string, parent *protocol.NodeInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if parent == nil {
+		log.Printf("[%s] parent_unreachable sem o campo parent; ignorado", id)
+		return
+	}
+	r, err := s.tree.Relocate(id, parent.ID)
+	switch {
+	case errors.Is(err, ErrNotParent):
+		// O aviso cruzou com um parent_changed: o nó já tem outro pai e vai
+		// tentar se conectar a ele.
+		log.Printf("[%s] avisou que não alcança %s, que já não é o pai dele; ignorado", id, parent.ID)
+		return
+	case errors.Is(err, ErrNoOtherSlot):
+		// O nó continua tentando e pode avisar de novo quando entrar mais gente.
+		log.Printf("[%s] não alcança o pai %s, mas não há outro pai com vaga; fica onde está", id, parent.ID)
+		return
+	case err != nil:
+		log.Printf("[%s] parent_unreachable: %v", id, err)
+		return
+	}
+
+	log.Printf("[%s] não alcança o pai %s; mudou para %s", id, r.OldParent.ID, r.Node.Parent.ID)
+	s.sendLocked(r.OldParent.ID, protocol.Message{Type: protocol.TypeChildRemoved, Child: r.Node.Info()})
+	s.sendLocked(id, protocol.Message{Type: protocol.TypeParentChanged, Parent: r.Node.Parent.Info()})
+	s.sendLocked(r.Node.Parent.ID, protocol.Message{Type: protocol.TypeChildAdded, Child: r.Node.Info()})
 	s.logTreeLocked()
 }
 

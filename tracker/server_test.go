@@ -196,6 +196,42 @@ func TestJoinLeaveAndRepair(t *testing.T) {
 	}
 }
 
+func TestParentUnreachable(t *testing.T) {
+	addr := startServer(t, 5*time.Second)
+
+	src := join(t, addr, protocol.RoleSource, 9001)
+	src.welcome("") // n1
+	a := join(t, addr, protocol.RolePeer, 9002)
+	a.welcome("n1") // n2
+	src.expectChild(protocol.TypeChildAdded, "n2")
+	b := join(t, addr, protocol.RolePeer, 9003)
+	b.welcome("n1") // n3
+	src.expectChild(protocol.TypeChildAdded, "n3")
+	c := join(t, addr, protocol.RolePeer, 9004)
+	w := c.welcome("n2") // n4
+	a.expectChild(protocol.TypeChildAdded, "n4")
+
+	// n4 não consegue se conectar a n2, que continua vivo. n4 vai para n3, o
+	// único outro nó com vaga no nível 1, e n2 continua na árvore.
+	unreachable := protocol.Message{Type: protocol.TypeParentUnreachable, Parent: w.Parent}
+	c.write(unreachable)
+	a.expectChild(protocol.TypeChildRemoved, "n4")
+	c.expectParentChanged("n3")
+	b.expectChild(protocol.TypeChildAdded, "n4")
+
+	// Um aviso atrasado (n2 já não é o pai) e um aviso sem o pai são ignorados:
+	// a próxima mensagem que n4 recebe é o pong.
+	c.write(unreachable)
+	c.write(protocol.Message{Type: protocol.TypeParentUnreachable})
+	c.write(protocol.Message{Type: protocol.TypePing})
+	c.expect(protocol.TypePong)
+
+	// n2 continua aceitando filhos: n5 entra debaixo dele.
+	d := join(t, addr, protocol.RolePeer, 9005)
+	d.welcome("n2") // n5
+	a.expectChild(protocol.TypeChildAdded, "n5")
+}
+
 func TestHeartbeatTimeout(t *testing.T) {
 	addr := startServer(t, 300*time.Millisecond)
 

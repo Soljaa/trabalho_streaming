@@ -12,13 +12,20 @@
 //	tracker -> nó:  {"type":"pong"}
 //	tracker -> nó:  {"type":"child_added","child":{"id":"n4","addr":"127.0.0.1:9004"}}
 //	nó -> tracker:  {"type":"leave"}
+//
+// Se o nó não consegue se conectar ao pai que recebeu (por exemplo, o firewall
+// da máquina do pai bloqueia a porta), ele avisa e o tracker o muda de lugar:
+//
+//	nó -> tracker:  {"type":"parent_unreachable","parent":{"id":"n2","addr":"127.0.0.1:9002"}}
+//	tracker -> nó:  {"type":"parent_changed","parent":{"id":"n3","addr":"127.0.0.1:9003"}}
 package protocol
 
 // Mensagens que o nó envia ao tracker.
 const (
-	TypeJoin  = "join"  // entrar na árvore (sempre a primeira mensagem)
-	TypePing  = "ping"  // heartbeat: "continuo vivo"
-	TypeLeave = "leave" // saída voluntária
+	TypeJoin              = "join"               // entrar na árvore (sempre a primeira mensagem)
+	TypePing              = "ping"               // heartbeat: "continuo vivo"
+	TypeLeave             = "leave"              // saída voluntária
+	TypeParentUnreachable = "parent_unreachable" // "não consigo me conectar a este pai"
 )
 
 // Mensagens que o tracker envia ao nó.
@@ -27,8 +34,8 @@ const (
 	TypeError         = "error"          // join recusado; o tracker fecha a conexão em seguida
 	TypePong          = "pong"           // resposta ao ping
 	TypeChildAdded    = "child_added"    // você ganhou um filho: comece a transmitir para ele
-	TypeChildRemoved  = "child_removed"  // seu filho saiu: pare de transmitir para ele
-	TypeParentChanged = "parent_changed" // seu pai saiu: passe a receber do novo pai
+	TypeChildRemoved  = "child_removed"  // seu filho saiu ou mudou de pai: pare de transmitir para ele
+	TypeParentChanged = "parent_changed" // seu pai saiu ou você não o alcançava: passe a receber do novo pai
 	TypeStreamEnded   = "stream_ended"   // a fonte saiu: a transmissão acabou
 )
 
@@ -58,7 +65,8 @@ type Message struct {
 	ID    string `json:"id,omitempty"`
 	Depth int    `json:"depth,omitempty"`
 
-	// welcome e parent_changed (nil para a fonte, que não tem pai)
+	// welcome e parent_changed: o pai do nó (nil para a fonte, que não tem pai).
+	// parent_unreachable: o pai que o nó não conseguiu alcançar.
 	Parent *NodeInfo `json:"parent,omitempty"`
 
 	// child_added e child_removed
